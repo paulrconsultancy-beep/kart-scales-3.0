@@ -152,7 +152,7 @@ try{
 }catch(e){}
 function save(){try{localStorage.setItem(LS,JSON.stringify(cfg))}catch(e){}}
 
-const mkRt=()=>({raw:null,hist:[],device:null,abort:null,handler:null,last:null,first:null,changed:new Set(),lastAt:0,name:"",busy:false});
+const mkRt=()=>({heard:0,withData:0,ids:new Set(),raw:null,hist:[],device:null,abort:null,handler:null,last:null,first:null,changed:new Set(),lastAt:0,name:"",busy:false});
 const rt={A:mkRt(),B:mkRt()};
 const $=id=>document.getElementById(id);
 const canHear=!!(window.BluetoothDevice&&"watchAdvertisements" in BluetoothDevice.prototype);
@@ -234,11 +234,14 @@ function reparse(k){const r=rt[k];if(r.last){const v=decode(cfg[k].field,r.last)
 const avg=k=>{const h=rt[k].hist;return h.length?h.reduce((a,b)=>a+b,0)/h.length:null};
 
 function onAdvert(k,ev){
-  const dv=ev.manufacturerData&&ev.manufacturerData.get(CID);
-  if(!dv)return;
-  const r=rt[k];
+  const r=rt[k];r.heard++;
+  const md=ev.manufacturerData;let id=CID,dv=md&&md.get(CID);
+  if(md)md.forEach((v,key)=>r.ids.add("0x"+key.toString(16).padStart(4,"0")));
+  if(!dv&&md&&md.size){const e=md.entries().next().value;id=e[0];dv=e[1]}
+  if(!dv){r.lastAt=Date.now();scheduleRender();return}
+  r.withData++;
   const u8=new Uint8Array(dv.byteLength+2);
-  u8[0]=CID&255;u8[1]=CID>>8;
+  u8[0]=id&255;u8[1]=id>>8;
   u8.set(new Uint8Array(dv.buffer,dv.byteOffset,dv.byteLength),2);
   if(!r.first)r.first=u8.slice();
   for(let i=0;i<u8.length;i++)if(r.first[i]!==u8[i])r.changed.add(i);
@@ -289,15 +292,16 @@ async function connect(k){
     try{device.gatt.disconnect()}catch(_){}
     r.busy=false;toast("Couldn’t wake the pad: "+e.message+". Make sure Proform’s app is closed and try again.");scheduleRender();return;
   }
-  r.device=device;r.first=null;r.changed=new Set();r.last=null;r.lastAt=Date.now();
+  r.device=device;r.heard=0;r.withData=0;r.ids=new Set();r.first=null;r.changed=new Set();r.last=null;r.lastAt=Date.now();
   r.handler=ev=>onAdvert(k,ev);
   device.addEventListener("advertisementreceived",r.handler);
   r.abort=new AbortController();
   try{
     await device.watchAdvertisements({signal:r.abort.signal});
   }catch(e){
-    toast("Couldn’t listen to the pad: "+e.message);cleanup(k);
+    toast("Couldn’t listen to the pad: "+e.message+". Trying another way…");
   }
+  setTimeout(()=>{if(rt[k].device===device&&rt[k].heard===0)startScan()},6000);
   r.busy=false;scheduleRender();
 }
 async function stop(k){
@@ -318,6 +322,23 @@ setInterval(()=>{
   for(const k of KEYS){const r=rt[k];if(r.device&&r.raw!=null&&Date.now()-r.lastAt>5000){r.raw=null;r.hist=[]}}
   scheduleRender();
 },1000);
+
+/* backup: general broadcast scan, matched to the chosen pads by device ID */
+let scan=null,scanHeard=0,scanNote="";
+async function startScan(){
+  if(scan)return;
+  if(!navigator.bluetooth.requestLEScan){scanNote="Backup scan not available in this Chrome.";scheduleRender();return}
+  try{
+    navigator.bluetooth.addEventListener("advertisementreceived",ev=>{
+      scanHeard++;
+      for(const k of KEYS){const r=rt[k];if(r.device&&ev.device&&ev.device.id===r.device.id)onAdvert(k,ev)}
+      scheduleRender();
+    });
+    scan=await navigator.bluetooth.requestLEScan({filters:[{namePrefix:"VS200"}],keepRepeatedDevices:true});
+    scanNote="Backup scan running.";
+  }catch(e){scanNote="Backup scan failed: "+e.message;toast(scanNote)}
+  scheduleRender();
+}
 
 /* ---------- actions ---------- */
 function setZero(k){
@@ -364,7 +385,7 @@ function render(){
     const age=r.device?Date.now()-r.lastAt:0;
     const dot=$("dot-"+k);
     dot.classList.toggle("on",(!!r.device&&r.last&&age<5000)||(!!demoId&&!r.device&&v!=null));
-    dot.classList.toggle("lost",!!r.device&&age>=5000);
+    dot.classList.toggle("lost",!!r.device&&!!r.last&&age>=5000);
     if(!r.busy){
       let st;
       if(r.device)st=!r.last?r.name+", listening…":(age>=5000?r.name+", no signal":r.name);
@@ -384,7 +405,9 @@ function render(){
       h+=`<div class="${cls}"><small>${i}</small>${b}</div>`;
     }
     $("by-"+k).innerHTML=h;
-    $("age-"+k).textContent=r.last?(age<5000?"Receiving broadcasts.":"Last broadcast "+Math.round(age/1000)+" s ago."):"No broadcast received yet.";
+    $("age-"+k).textContent=(r.last?(age<5000?"Receiving broadcasts. ":"Last broadcast "+Math.round(age/1000)+" s ago. "):"No weight data yet. ")
+      +"Heard: "+r.heard+", with data: "+r.withData+(r.ids.size?", IDs: "+[...r.ids].join(" "):"")
+      +(scan||scanNote?". Scan heard: "+scanHeard+". "+scanNote:"");
   }
   $("total").textContent=n?fmt(Math.round(sum*10)/10):"—";
   $("totalNote").textContent=n===2?"Scale A + Scale B":n===1?"Only one pad reading. Total is incomplete.":"Connect both pads to weigh.";
