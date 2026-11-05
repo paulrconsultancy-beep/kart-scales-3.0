@@ -115,6 +115,15 @@ input,select{width:100%;font:500 1rem "Barlow",sans-serif;color:var(--text);back
 
   <section class="pair" id="pair"></section>
 
+  <details class="panel" id="pairPanel">
+    <summary>Paired pads</summary>
+    <div class="pbody">
+      <p>Pair each scale with a pad once. After that, Connect goes straight to that pad without asking. Chrome hides Bluetooth MAC addresses from web pages, so each pad is remembered by the private ID Chrome gives it, which stays the same unless you forget the pad or clear Chrome’s site data.</p>
+      <p class="hide" id="noRemember" style="color:var(--warn)">This Chrome can’t remember pads between visits. Check that Experimental Web Platform features is still Enabled in chrome://flags.</p>
+      <div id="pairBlocks"></div>
+    </div>
+  </details>
+
   <details class="panel" id="calPanel">
     <summary>Calibration and smoothing</summary>
     <div class="pbody">
@@ -150,7 +159,7 @@ const PRESETS={
   weight:{offset:8,len:2,little:true,signed:true},
   sensor:{offset:17,len:3,little:false,signed:false}
 };
-const defSlot=()=>({preset:"weight",field:{...PRESETS.weight},cal:{offset:0,factor:1}});
+const defSlot=()=>({pairId:null,pairName:"",preset:"weight",field:{...PRESETS.weight},cal:{offset:0,factor:1}});
 let cfg={A:defSlot(),B:defSlot(),smooth:"normal"};
 try{
   const s=JSON.parse(localStorage.getItem(LS)||"null");
@@ -166,13 +175,17 @@ const canHear=!!(window.BluetoothDevice&&"watchAdvertisements" in BluetoothDevic
 if(navigator.bluetooth&&!canHear)$("flagNotice").classList.remove("hide");
 
 /* ---------- build UI ---------- */
-let pairHTML="",calHTML="",setHTML="";
+let pairHTML="",calHTML="",setHTML="",ppHTML="";
 for(const k of KEYS){
   pairHTML+=`<div class="scale">
     <div class="head"><span>Scale ${k}</span><span class="dot" id="dot-${k}"></span></div>
     <div class="mid num"><span id="w-${k}">—</span><span class="u">kg</span></div>
     <div class="st" id="st-${k}">Not connected</div>
     <div class="btns"><button class="btn primary" data-act="connect" data-k="${k}" id="cb-${k}">Connect</button><button class="btn" data-act="zero" data-k="${k}">Zero</button></div>
+  </div>`;
+  ppHTML+=`<div class="block"><h3>Scale ${k}</h3>
+    <dl class="kv"><dt>Paired pad</dt><dd id="pp-${k}">Not paired</dd></dl>
+    <div class="btns"><button class="btn primary" data-act="pair" data-k="${k}">Pair pad</button><button class="btn" data-act="forget" data-k="${k}">Forget</button></div>
   </div>`;
   calHTML+=`<div class="block"><h3>Scale ${k}</h3>
     <dl class="kv"><dt>Live reading</dt><dd id="cr-${k}">—</dd><dt>Zero point</dt><dd id="co-${k}"></dd><dt>Factor</dt><dd id="cf-${k}"></dd></dl>
@@ -201,7 +214,9 @@ for(const k of KEYS){
     <div class="small" style="margin-top:6px">Decoded value: <span id="rv-${k}">—</span></div>
   </div>`;
 }
-$("pair").innerHTML=pairHTML;$("calBlocks").innerHTML=calHTML;$("setupBlocks").innerHTML=setHTML;
+$("pair").innerHTML=pairHTML;$("pairBlocks").innerHTML=ppHTML;
+const canRemember=!!(navigator.bluetooth&&navigator.bluetooth.getDevices);
+if(navigator.bluetooth&&!canRemember)$("noRemember").classList.remove("hide");$("calBlocks").innerHTML=calHTML;$("setupBlocks").innerHTML=setHTML;
 
 function loadForm(k){
   const f=cfg[k].field;
@@ -308,13 +323,10 @@ async function connect(k){
   if(!navigator.bluetooth){toast("Bluetooth isn’t available in this browser. Open this page in Chrome on Android with Bluetooth and Location switched on.");return}
   if(r.device){await stop(k);return}
   if(!canHear){$("flagNotice").classList.remove("hide");window.scrollTo(0,0);toast("Turn on the Chrome setting shown at the top first.");return}
-  let device;
-  try{
-    device=await navigator.bluetooth.requestDevice({filters:[{namePrefix:"VS200"}],optionalServices:[SVC],optionalManufacturerData:[CID]});
-  }catch(e){
-    if(e.name==="NotFoundError")return;
-    if(e.name==="SecurityError"){toast("Bluetooth is blocked on this page. Open it from your own web address in Chrome.");return}
-    toast("Couldn’t start Bluetooth: "+e.message);return;
+  let device=await pairedDevice(k);
+  if(!device){
+    if(cfg[k].pairId)toast("Couldn’t find Scale "+k+"’s paired pad. Pick it again.");
+    device=await pickDevice(k);if(!device)return;
   }
   const other=k==="A"?"B":"A";
   if(rt[other].device&&rt[other].device.id===device.id){toast("That pad is already Scale "+other+". Pick a different pad.");return}
@@ -339,6 +351,43 @@ async function connect(k){
   setTimeout(()=>{if(rt[k].device===device&&rt[k].heard===0)startScan()},6000);
   r.busy=false;scheduleRender();
 }
+/* ---------- pairing ---------- */
+async function pairedDevice(k){
+  const id=cfg[k].pairId;
+  if(!id||!canRemember)return null;
+  try{return (await navigator.bluetooth.getDevices()).find(d=>d.id===id)||null}catch(e){return null}
+}
+async function pickDevice(k){
+  let device;
+  try{
+    device=await navigator.bluetooth.requestDevice({filters:[{namePrefix:"VS200"}],optionalServices:[SVC],optionalManufacturerData:[CID]});
+  }catch(e){
+    if(e.name==="NotFoundError")return null;
+    if(e.name==="SecurityError"){toast("Bluetooth is blocked on this page. Open it from your own web address in Chrome.");return null}
+    toast("Couldn’t start Bluetooth: "+e.message);return null;
+  }
+  const other=k==="A"?"B":"A";
+  if(cfg[other].pairId===device.id){toast("That pad is already paired as Scale "+other+". Pick a different pad.");return null}
+  cfg[k].pairId=device.id;cfg[k].pairName=device.name||"Pad";save();scheduleRender();
+  return device;
+}
+async function pairPad(k){
+  if(!navigator.bluetooth){toast("Bluetooth isn’t available in this browser.");return}
+  if(rt[k].busy)return;
+  if(rt[k].device)await stop(k);
+  const d=await pickDevice(k);
+  if(d)toast("Pad paired as Scale "+k+". Tap Connect to use it.");
+}
+async function forgetPad(k){
+  if(rt[k].busy)return;
+  if(!cfg[k].pairId){toast("Scale "+k+" has no paired pad.");return}
+  if(rt[k].device)await stop(k);
+  const d=await pairedDevice(k);
+  cfg[k].pairId=null;cfg[k].pairName="";save();
+  try{d&&d.forget&&await d.forget()}catch(e){}
+  toast("Scale "+k+"’s pad forgotten.");scheduleRender();
+}
+
 async function stop(k){
   const r=rt[k],d=r.device;
   r.busy=true;$("st-"+k).textContent="Switching pad off…";
@@ -422,7 +471,7 @@ document.addEventListener("click",e=>{
   requestWake();
   const b=e.target.closest("[data-act]");if(!b)return;
   const k=b.dataset.k;
-  ({connect,zero:setZero,cal:calibrate,reset:resetCal})[b.dataset.act](k);
+  ({connect,zero:setZero,cal:calibrate,reset:resetCal,pair:pairPad,forget:forgetPad})[b.dataset.act](k);
 });
 
 /* ---------- demo ---------- */
@@ -457,6 +506,7 @@ function render(){
     }
     $("cb-"+k).textContent=r.device?"Disconnect":"Connect";
     $("cb-"+k).disabled=r.busy;
+    $("pp-"+k).textContent=cfg[k].pairId?cfg[k].pairName+" (ID ending "+cfg[k].pairId.slice(-6)+")":"Not paired";
     $("cr-"+k).textContent=fmtRaw(r.raw);
     $("co-"+k).textContent=fmtRaw(cfg[k].cal.offset);
     $("cf-"+k).textContent=cfg[k].cal.factor===1?"1 (not calibrated)":String(Math.round(cfg[k].cal.factor*1e8)/1e8);
