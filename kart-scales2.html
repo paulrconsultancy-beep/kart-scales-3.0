@@ -159,7 +159,7 @@ try{
 }catch(e){}
 function save(){try{localStorage.setItem(LS,JSON.stringify(cfg))}catch(e){}}
 
-const mkRt=()=>({samples:[],shown:null,wokeAt:0,nextTry:0,prevState:null,heard:0,withData:0,ids:new Set(),raw:null,hist:[],device:null,abort:null,handler:null,last:null,first:null,changed:new Set(),lastAt:0,name:"",busy:false});
+const mkRt=()=>({hw:0,hs:0,rewakes:0,restarts:0,watchAt:0,samples:[],shown:null,wokeAt:0,nextTry:0,prevState:null,heard:0,withData:0,ids:new Set(),raw:null,hist:[],device:null,abort:null,handler:null,last:null,first:null,changed:new Set(),lastAt:0,name:"",busy:false});
 const rt={A:mkRt(),B:mkRt()};
 const $=id=>document.getElementById(id);
 const canHear=!!(window.BluetoothDevice&&"watchAdvertisements" in BluetoothDevice.prototype);
@@ -261,8 +261,8 @@ function stable(k){
 function reparse(k){const r=rt[k];if(r.last){const v=decode(cfg[k].field,r.last);if(v!=null)pushRaw(k,v)}scheduleRender()}
 const avg=k=>filtered(k,4000);
 
-function onAdvert(k,ev){
-  const r=rt[k];r.heard++;
+function onAdvert(k,ev,src){
+  const r=rt[k];r.heard++;if(src==="s")r.hs++;else r.hw++;
   const md=ev.manufacturerData;let id=CID,dv=md&&md.get(CID);
   if(md)md.forEach((v,key)=>r.ids.add("0x"+key.toString(16).padStart(4,"0")));
   if(!dv&&md&&md.size){const e=md.entries().next().value;id=e[0];dv=e[1]}
@@ -326,8 +326,8 @@ async function connect(k){
     try{device.gatt.disconnect()}catch(_){}
     r.busy=false;toast("Couldn’t wake the pad: "+e.message+". Make sure Proform’s app is closed and try again.");scheduleRender();return;
   }
-  r.device=device;r.heard=0;r.withData=0;r.ids=new Set();r.first=null;r.changed=new Set();r.last=null;r.lastAt=Date.now();
-  r.handler=ev=>onAdvert(k,ev);
+  r.device=device;r.hw=0;r.hs=0;r.rewakes=0;r.restarts=0;r.watchAt=Date.now();r.heard=0;r.withData=0;r.ids=new Set();r.first=null;r.changed=new Set();r.last=null;r.lastAt=Date.now();
+  r.handler=ev=>onAdvert(k,ev,"w");
   device.addEventListener("advertisementreceived",r.handler);
   r.abort=new AbortController();
   try{
@@ -355,19 +355,22 @@ function cleanup(k){
 }
 /* the pads drop out after about a minute, so: wake again when a pad goes quiet,
    and refresh every 45 s before it times out */
-async function rewake(k){
+/* Re-sending the wake command doesn't touch the listening. Restarting the listening
+   is a new Bluetooth scan, and Android ignores apps that start more than ~5 scans in
+   30 s, so that only happens after 12 s of silence and never more than once per 30 s. */
+async function rewake(k,restart){
   const r=rt[k],d=r.device;
   if(!d||r.busy)return;
-  r.busy=true;$("st-"+k).textContent=r.name+", keeping awake…";
-  try{
-    try{r.abort&&r.abort.abort()}catch(e){}
-    await sendCommand(d,"ONN"+k);
-    if(rt[k].device===d){
-      r.abort=new AbortController();
+  r.busy=true;r.rewakes++;$("st-"+k).textContent=r.name+", keeping awake…";
+  try{await sendCommand(d,"ONN"+k);r.wokeAt=Date.now()}
+  catch(e){try{d.gatt.disconnect()}catch(_){}}
+  if(restart&&rt[k].device===d&&Date.now()-r.watchAt>30000){
+    try{
+      try{r.abort&&r.abort.abort()}catch(e){}
+      r.abort=new AbortController();r.watchAt=Date.now();r.restarts++;
       await d.watchAdvertisements({signal:r.abort.signal});
-      r.wokeAt=Date.now();
-    }
-  }catch(e){try{d.gatt.disconnect()}catch(_){}}
+    }catch(e){}
+  }
   r.busy=false;scheduleRender();
 }
 setInterval(()=>{
@@ -376,7 +379,7 @@ setInterval(()=>{
     const r=rt[k];
     if(r.device&&!r.busy&&now>=r.nextTry){
       const quiet=now-r.lastAt>(r.last?4000:10000),due=now-r.wokeAt>45000;
-      if(quiet||due){r.nextTry=now+3000;rewake(k)}
+      if(quiet||due){r.nextTry=now+8000;rewake(k,now-r.lastAt>12000)}
     }
     if(r.device&&r.raw!=null&&now-r.lastAt>STALE){r.raw=null;r.hist=[];r.samples=[];r.shown=null}
   }
@@ -391,7 +394,7 @@ async function startScan(){
   try{
     navigator.bluetooth.addEventListener("advertisementreceived",ev=>{
       scanHeard++;
-      for(const k of KEYS){const r=rt[k];if(r.device&&ev.device&&ev.device.id===r.device.id)onAdvert(k,ev)}
+      for(const k of KEYS){const r=rt[k];if(r.device&&ev.device&&ev.device.id===r.device.id)onAdvert(k,ev,"s")}
       scheduleRender();
     });
     scan=await navigator.bluetooth.requestLEScan({filters:[{namePrefix:"VS200"}],keepRepeatedDevices:true});
@@ -466,7 +469,9 @@ function render(){
     }
     $("by-"+k).innerHTML=h;
     $("age-"+k).textContent=(r.last?(age<STALE?"Receiving broadcasts. ":"Last broadcast "+Math.round(age/1000)+" s ago. "):"No weight data yet. ")
-      +"Heard: "+r.heard+", with data: "+r.withData+(r.ids.size?", IDs: "+[...r.ids].join(" "):"")
+      +"Mode: "+(r.last?(r.last[3]===2?"weighing":"idle")+" ("+r.last[3]+")":"—")
+      +". Heard: "+r.heard+" (listen "+r.hw+", scan "+r.hs+"), with data: "+r.withData
+      +". Wakes: "+r.rewakes+", restarts: "+r.restarts+(r.ids.size?", IDs: "+[...r.ids].join(" "):"")
       +(scan||scanNote?". Scan heard: "+scanHeard+". "+scanNote:"");
   }
   $("total").textContent=n?fmt(Math.round(sum*10)/10):"—";
