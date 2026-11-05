@@ -116,9 +116,15 @@ input,select{width:100%;font:500 1rem "Barlow",sans-serif;color:var(--text);back
   <section class="pair" id="pair"></section>
 
   <details class="panel" id="calPanel">
-    <summary>Calibration</summary>
+    <summary>Calibration and smoothing</summary>
     <div class="pbody">
       <p>Do this once per pad. With the pad empty, tap Set zero. Then place a weight you know exactly (e.g. 20.0 kg of plates) in the middle of that pad, enter it and tap Calibrate. Settings are saved on this phone.</p>
+      <label class="f" for="smooth">Smoothing</label>
+      <select id="smooth">
+        <option value="off">Off (fastest, most jumpy)</option>
+        <option value="normal">Normal (2-second average)</option>
+        <option value="strong">Strong (4-second average)</option>
+      </select>
       <div id="calBlocks"></div>
     </div>
   </details>
@@ -145,14 +151,15 @@ const PRESETS={
   sensor:{offset:17,len:3,little:false,signed:false}
 };
 const defSlot=()=>({preset:"weight",field:{...PRESETS.weight},cal:{offset:0,factor:1}});
-let cfg={A:defSlot(),B:defSlot()};
+let cfg={A:defSlot(),B:defSlot(),smooth:"normal"};
 try{
   const s=JSON.parse(localStorage.getItem(LS)||"null");
+  if(s&&s.smooth)cfg.smooth=s.smooth;
   if(s)for(const k of KEYS)if(s[k]){const d=defSlot();cfg[k]={...d,...s[k],field:{...d.field,...(s[k].field||{})},cal:{...d.cal,...(s[k].cal||{})}}}
 }catch(e){}
 function save(){try{localStorage.setItem(LS,JSON.stringify(cfg))}catch(e){}}
 
-const mkRt=()=>({heard:0,withData:0,ids:new Set(),raw:null,hist:[],device:null,abort:null,handler:null,last:null,first:null,changed:new Set(),lastAt:0,name:"",busy:false});
+const mkRt=()=>({samples:[],shown:null,wokeAt:0,nextTry:0,prevState:null,heard:0,withData:0,ids:new Set(),raw:null,hist:[],device:null,abort:null,handler:null,last:null,first:null,changed:new Set(),lastAt:0,name:"",busy:false});
 const rt={A:mkRt(),B:mkRt()};
 const $=id=>document.getElementById(id);
 const canHear=!!(window.BluetoothDevice&&"watchAdvertisements" in BluetoothDevice.prototype);
@@ -204,7 +211,7 @@ function loadForm(k){
 function fieldChanged(k,preset){
   cfg[k].preset=preset;
   if(cfg[k].cal.offset!==0||cfg[k].cal.factor!==1){cfg[k].cal={offset:0,factor:1};toast("Scale "+k+" calibration reset because the reading source changed.")}
-  save();rt[k].hist=[];reparse(k);
+  save();rt[k].hist=[];rt[k].samples=[];rt[k].shown=null;reparse(k);
 }
 for(const k of KEYS){
   loadForm(k);
@@ -220,6 +227,11 @@ for(const k of KEYS){
   $("sgn-"+k).addEventListener("change",e=>{f().signed=e.target.value==="1";$("pre-"+k).value="custom";fieldChanged(k,"custom")});
 }
 
+const STALE=8000;
+const WIN={off:0,normal:2000,strong:4000};
+$("smooth").value=cfg.smooth;
+$("smooth").addEventListener("change",e=>{cfg.smooth=e.target.value;save();for(const k of KEYS)rt[k].shown=null;scheduleRender()});
+
 /* ---------- parsing ---------- */
 function decode(f,u8){
   const o=f.offset,L=f.len;
@@ -229,9 +241,25 @@ function decode(f,u8){
   if(f.signed&&v>=Math.pow(2,8*L-1))v-=Math.pow(2,8*L);
   return v;
 }
-function pushRaw(k,v){const r=rt[k];r.raw=v;r.hist.push(v);if(r.hist.length>10)r.hist.shift()}
+function pushRaw(k,v){
+  const r=rt[k],now=Date.now();r.raw=v;r.hist.push(v);if(r.hist.length>10)r.hist.shift();
+  r.samples.push({t:now,v});while(r.samples.length&&now-r.samples[0].t>6000)r.samples.shift();
+}
+/* trimmed mean of the last `win` ms: drops the highest and lowest 20% before averaging */
+function filtered(k,win){
+  const r=rt[k];if(r.raw==null)return null;if(!win)return r.raw;
+  const now=Date.now(),xs=r.samples.filter(s=>now-s.t<=win).map(s=>s.v).sort((a,b)=>a-b);
+  if(!xs.length)return r.raw;
+  const cut=xs.length>=5?Math.floor(xs.length*.2):0,ys=xs.slice(cut,xs.length-cut);
+  return ys.reduce((a,b)=>a+b,0)/ys.length;
+}
+const toKg=(k,raw)=>(raw-cfg[k].cal.offset)*cfg[k].cal.factor;
+function stable(k){
+  const now=Date.now(),xs=rt[k].samples.filter(s=>now-s.t<=2000).map(s=>toKg(k,s.v));
+  return xs.length>=3&&Math.max(...xs)-Math.min(...xs)<=0.2;
+}
 function reparse(k){const r=rt[k];if(r.last){const v=decode(cfg[k].field,r.last);if(v!=null)pushRaw(k,v)}scheduleRender()}
-const avg=k=>{const h=rt[k].hist;return h.length?h.reduce((a,b)=>a+b,0)/h.length:null};
+const avg=k=>filtered(k,4000);
 
 function onAdvert(k,ev){
   const r=rt[k];r.heard++;
@@ -243,6 +271,8 @@ function onAdvert(k,ev){
   const u8=new Uint8Array(dv.byteLength+2);
   u8[0]=id&255;u8[1]=id>>8;
   u8.set(new Uint8Array(dv.buffer,dv.byteOffset,dv.byteLength),2);
+  if(r.prevState===2&&u8[3]===1){r.nextTry=0;rewake(k)}  // pad dropped out of weighing mode
+  r.prevState=u8[3];
   if(!r.first)r.first=u8.slice();
   for(let i=0;i<u8.length;i++)if(r.first[i]!==u8[i])r.changed.add(i);
   r.last=u8;r.lastAt=Date.now();
@@ -252,10 +282,14 @@ function onAdvert(k,ev){
 }
 
 /* ---------- weight ---------- */
+/* shown in 0.1 kg steps; with smoothing on, the display only moves once the
+   filtered weight is a full 0.1 kg away from what's shown, so it doesn't flicker */
 function kg(k){
-  const r=rt[k].raw;if(r==null)return null;
-  const q=Math.round((r-cfg[k].cal.offset)*cfg[k].cal.factor*10)/10;
-  return Math.abs(q)<0.05?0:q;
+  const r=rt[k],f=filtered(k,WIN[cfg.smooth]);
+  if(f==null){r.shown=null;return null}
+  const v=toKg(k,f);
+  if(r.shown==null||cfg.smooth==="off"||Math.abs(v-r.shown)>=0.1)r.shown=Math.round(v*10)/10;
+  return Math.abs(r.shown)<0.05?0:r.shown;
 }
 const fmt=v=>v.toFixed(1);
 const fmtRaw=v=>v==null?"—":(Number.isInteger(v)?String(v):(Math.round(v*1000)/1000).toString());
@@ -301,6 +335,7 @@ async function connect(k){
   }catch(e){
     toast("Couldn’t listen to the pad: "+e.message+". Trying another way…");
   }
+  r.wokeAt=Date.now();
   setTimeout(()=>{if(rt[k].device===device&&rt[k].heard===0)startScan()},6000);
   r.busy=false;scheduleRender();
 }
@@ -315,11 +350,36 @@ function cleanup(k){
   const r=rt[k];
   try{r.abort&&r.abort.abort()}catch(e){}
   if(r.device&&r.handler)r.device.removeEventListener("advertisementreceived",r.handler);
-  r.device=null;r.abort=null;r.handler=null;r.raw=null;r.hist=[];
+  r.device=null;r.abort=null;r.handler=null;r.raw=null;r.hist=[];r.samples=[];r.shown=null;
   scheduleRender();
 }
+/* the pads drop out after about a minute, so: wake again when a pad goes quiet,
+   and refresh every 45 s before it times out */
+async function rewake(k){
+  const r=rt[k],d=r.device;
+  if(!d||r.busy)return;
+  r.busy=true;$("st-"+k).textContent=r.name+", keeping awake…";
+  try{
+    try{r.abort&&r.abort.abort()}catch(e){}
+    await sendCommand(d,"ONN"+k);
+    if(rt[k].device===d){
+      r.abort=new AbortController();
+      await d.watchAdvertisements({signal:r.abort.signal});
+      r.wokeAt=Date.now();
+    }
+  }catch(e){try{d.gatt.disconnect()}catch(_){}}
+  r.busy=false;scheduleRender();
+}
 setInterval(()=>{
-  for(const k of KEYS){const r=rt[k];if(r.device&&r.raw!=null&&Date.now()-r.lastAt>5000){r.raw=null;r.hist=[]}}
+  const now=Date.now();
+  for(const k of KEYS){
+    const r=rt[k];
+    if(r.device&&!r.busy&&now>=r.nextTry){
+      const quiet=now-r.lastAt>(r.last?4000:10000),due=now-r.wokeAt>45000;
+      if(quiet||due){r.nextTry=now+3000;rewake(k)}
+    }
+    if(r.device&&r.raw!=null&&now-r.lastAt>STALE){r.raw=null;r.hist=[];r.samples=[];r.shown=null}
+  }
   scheduleRender();
 },1000);
 
@@ -343,7 +403,7 @@ async function startScan(){
 /* ---------- actions ---------- */
 function setZero(k){
   const a=avg(k);if(a==null){toast("No reading from Scale "+k+" yet.");return}
-  cfg[k].cal.offset=a;save();rt[k].hist=[];toast("Scale "+k+" zeroed.");scheduleRender();
+  cfg[k].cal.offset=a;rt[k].shown=null;save();rt[k].hist=[];rt[k].samples=[];rt[k].shown=null;toast("Scale "+k+" zeroed.");scheduleRender();
 }
 function calibrate(k){
   const K=parseFloat(($("kw-"+k).value||"").replace(",","."));
@@ -351,7 +411,7 @@ function calibrate(k){
   const a=avg(k);if(a==null){toast("No reading from Scale "+k+" yet.");return}
   const d=a-cfg[k].cal.offset;
   if(Math.abs(d)<1e-6){toast("The reading hasn’t changed since zeroing. Put the known weight on the pad, then tap Calibrate.");return}
-  cfg[k].cal.factor=K/d;save();toast("Scale "+k+" calibrated to "+K.toFixed(1)+" kg.");scheduleRender();
+  cfg[k].cal.factor=K/d;rt[k].shown=null;save();toast("Scale "+k+" calibrated to "+K.toFixed(1)+" kg.");scheduleRender();
 }
 function resetCal(k){cfg[k].cal={offset:0,factor:1};save();toast("Scale "+k+" calibration reset.");scheduleRender()}
 
@@ -365,10 +425,10 @@ document.addEventListener("click",e=>{
 /* ---------- demo ---------- */
 let demoId=null;
 $("demoBtn").addEventListener("click",()=>{
-  if(demoId){clearInterval(demoId);demoId=null;for(const k of KEYS)if(!rt[k].device){rt[k].raw=null;rt[k].hist=[]}}
+  if(demoId){clearInterval(demoId);demoId=null;for(const k of KEYS)if(!rt[k].device){rt[k].raw=null;rt[k].hist=[];rt[k].samples=[];rt[k].shown=null}}
   else{
     const base={A:62.3,B:58.9};
-    demoId=setInterval(()=>{for(const k of KEYS)if(!rt[k].device){const v=Math.round((base[k]+(Math.random()-.5)*.1)*10)/10;rt[k].raw=v;rt[k].hist.push(v);if(rt[k].hist.length>10)rt[k].hist.shift()}scheduleRender()},300);
+    demoId=setInterval(()=>{for(const k of KEYS)if(!rt[k].device){pushRaw(k,base[k]+(Math.random()-.5)*.6)}scheduleRender()},300);
   }
   $("demoBtn").setAttribute("aria-pressed",demoId?"true":"false");scheduleRender();
 });
@@ -384,11 +444,11 @@ function render(){
     if(v!=null){sum+=v;n++}
     const age=r.device?Date.now()-r.lastAt:0;
     const dot=$("dot-"+k);
-    dot.classList.toggle("on",(!!r.device&&r.last&&age<5000)||(!!demoId&&!r.device&&v!=null));
-    dot.classList.toggle("lost",!!r.device&&!!r.last&&age>=5000);
+    dot.classList.toggle("on",(!!r.device&&r.last&&age<STALE)||(!!demoId&&!r.device&&v!=null));
+    dot.classList.toggle("lost",!!r.device&&!!r.last&&age>=STALE);
     if(!r.busy){
       let st;
-      if(r.device)st=!r.last?r.name+", listening…":(age>=5000?r.name+", no signal":r.name);
+      if(r.device)st=!r.last?r.name+", listening…":(age>=STALE?r.name+", no signal":r.name+(stable(k)?", stable":", settling"));
       else st=demoId?"Demo":"Not connected";
       $("st-"+k).textContent=st;
     }
@@ -405,12 +465,12 @@ function render(){
       h+=`<div class="${cls}"><small>${i}</small>${b}</div>`;
     }
     $("by-"+k).innerHTML=h;
-    $("age-"+k).textContent=(r.last?(age<5000?"Receiving broadcasts. ":"Last broadcast "+Math.round(age/1000)+" s ago. "):"No weight data yet. ")
+    $("age-"+k).textContent=(r.last?(age<STALE?"Receiving broadcasts. ":"Last broadcast "+Math.round(age/1000)+" s ago. "):"No weight data yet. ")
       +"Heard: "+r.heard+", with data: "+r.withData+(r.ids.size?", IDs: "+[...r.ids].join(" "):"")
       +(scan||scanNote?". Scan heard: "+scanHeard+". "+scanNote:"");
   }
   $("total").textContent=n?fmt(Math.round(sum*10)/10):"—";
-  $("totalNote").textContent=n===2?"Scale A + Scale B":n===1?"Only one pad reading. Total is incomplete.":"Connect both pads to weigh.";
+  $("totalNote").textContent=n===2?(stable("A")&&stable("B")?"Stable":"Settling…"):n===1?"Only one pad reading. Total is incomplete.":"Connect both pads to weigh.";
 }
 
 /* ---------- misc ---------- */
